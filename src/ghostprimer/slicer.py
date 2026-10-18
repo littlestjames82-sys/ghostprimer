@@ -50,6 +50,11 @@ def _decorators(node) -> list[str]:
 
 
 def _python_signatures(source: str) -> str:
+    """Signature-depth slice of a Python module (real ``ast``).
+
+    Keeps imports, function and class signatures, docstring first
+    lines, and UPPER_CASE assignments; bodies become ``...``.
+    """
     tree = ast.parse(source)
     lines: list[str] = []
     module_doc = _doc_first_line(tree)
@@ -103,6 +108,8 @@ def _python_signatures(source: str) -> str:
 
 
 def _python_outline(source: str) -> str:
+    """Outline-depth slice of a Python module: top-level names only,
+    with a class's method names in parentheses."""
     tree = ast.parse(source)
     names: list[str] = []
     for node in tree.body:
@@ -121,6 +128,8 @@ _JS_SIG = re.compile(
 
 
 def _js_slice(source: str, outline_only: bool) -> str:
+    """Parser-lite JS/TS slice: import/export lines and declaration
+    lines; signature mode adds a ``...`` body marker, outline does not."""
     out = []
     for line in source.splitlines():
         stripped = line.strip()
@@ -134,7 +143,14 @@ def _js_slice(source: str, outline_only: bool) -> str:
 
 
 def slice_source(rel: str, source: str, mode: str) -> tuple[str, str]:
-    """Return (sliced_text, confidence) for the requested mode."""
+    """Return (sliced_text, confidence) for the requested mode.
+
+    Modes: "full", "signatures", "outline" (bundle building also
+    relies on the head fallback inside this function for languages
+    without a slicer). Confidence is "ast" for Python, "parser-lite"
+    for JS/TS, and "head" / "head-fallback" for excerpted text, and
+    is recorded verbatim in the manifest.
+    """
     ext = Path(rel).suffix.lower()
     if mode == "full":
         return source, "full"

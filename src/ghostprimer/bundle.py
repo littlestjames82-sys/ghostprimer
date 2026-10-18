@@ -33,6 +33,7 @@ TEMPLATE_NOTE = ("(template) This pack was built by GhostPrimer from "
 
 
 def sha256_text(text: str) -> str:
+    """SHA-256 hex digest of *text* (UTF-8), as recorded in the manifest."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -40,9 +41,61 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _write_text_no_follow(path: Path, text: str) -> None:
+    """Write text without following a pre-planted symlink at path.
+
+    If the destination (or a directory component created for it inside
+    its parent chain) is a symlink, replace the link itself with a real
+    file/directory instead of writing through it to a victim outside
+    the bundle.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    # Replace symlinked directory components directly under the bundle
+    # output tree is handled by callers for files/; here the final
+    # component is the critical one for PRIMER.md / manifest.json and
+    # for each sliced file.
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        path.unlink()
+    path.write_text(text, encoding="utf-8")
+
+
+def _ensure_real_parent(files_dir: Path, dest: Path) -> None:
+    """Create dest's parent dirs under files_dir as real directories,
+    replacing any symlinked component so writes cannot escape."""
+    rel_parent = dest.parent.relative_to(files_dir)
+    current = files_dir
+    for part in rel_parent.parts:
+        current = current / part
+        if current.is_symlink():
+            current.unlink()
+        current.mkdir(exist_ok=True)
+
+
 def build_bundle(project, out, budget: int = DEFAULT_BUDGET,
                  recall_bundle=None, task: str = "",
                  handoff_pack=None) -> dict:
+    """Build a starter bundle and return its manifest dict.
+
+    Arguments:
+      project: project root directory. Refused (ValueError) if missing
+        or if it resolves to a private memory location.
+      out: bundle folder to write (PRIMER.md, manifest.json, files/).
+      budget: total estimated-token budget; memory is capped at
+        MEMORY_SHARE (40 percent) of it. An unmeetable budget still
+        produces a bundle, flagged ``budget_unmet`` in the manifest.
+      recall_bundle: optional GhostRecall bundle directory; when given,
+        its current items are the memory source instead of the fallback.
+      task: optional label recorded verbatim in the manifest; it does
+        not change selection.
+      handoff_pack: optional GhostHandoff pack directory or its
+        handoff.json file; its items join the same capped memory pool.
+
+    Raises ValueError for a refused project, recall bundle, or handoff
+    pack (outside-root or private-memory source, mismatched project,
+    unreadable pack, and similar). Secret-flagged files and items are
+    not errors: they are excluded or blocked and recorded.
+    """
     root = Path(project)
     if not root.is_dir():
         raise ValueError(f"project not found: {project}")
@@ -129,7 +182,24 @@ def build_bundle(project, out, budget: int = DEFAULT_BUDGET,
     budget_unmet = False
     sliced_texts: dict[str, str] = {}
     for rel, is_entry in candidates:
-        source = (root / rel).read_text(encoding="utf-8", errors="replace")
+        # Security-critical: a code file listed by the walk can be a
+        # symlink whose target lives outside the project (or in the
+        # user's private memory). Never read it without the resolved-
+        # path check the memory path already used; record the refusal.
+        try:
+            resolved_src = scan.assert_project_local(root, root / rel)
+            if resolved_src.is_dir():
+                raise ValueError(f"refused: source is a directory: {rel}")
+            source = resolved_src.read_text(
+                encoding="utf-8", errors="replace")
+        except ValueError as exc:
+            not_included.append({"path": rel, "reason": str(exc)})
+            continue
+        except OSError as exc:
+            not_included.append({
+                "path": rel,
+                "reason": f"source unreadable; excluded: {exc}"})
+            continue
         findings = secrets_mod.scan_text(source)
         if findings:
             not_included.append({
@@ -176,21 +246,29 @@ def build_bundle(project, out, budget: int = DEFAULT_BUDGET,
     readme = scan.readme_path(root)
     readme_text = ""
     if readme is not None:
-        raw = readme.read_text(encoding="utf-8", errors="replace")
-        if not secrets_mod.scan_text(raw):
+        try:
+            resolved_readme = scan.assert_project_local(root, readme)
+            raw = resolved_readme.read_text(encoding="utf-8", errors="replace")
+        except (ValueError, OSError) as exc:
+            blocked.append({"path": readme.name,
+                            "reason": f"README refused or unreadable: {exc}"})
+            raw = None
+        if raw is not None and not secrets_mod.scan_text(raw):
             readme_text = memory_mod.readme_extract(raw)
-        else:
+        elif raw is not None:
             blocked.append({"path": readme.name,
                             "reason": "secret-shaped literal in README; "
                                       "extract blocked"})
 
     # --- write files/ ---
     files_dir = out / "files"
+    if files_dir.is_symlink():
+        files_dir.unlink()
     files_dir.mkdir(parents=True, exist_ok=True)
     for rel, text in sliced_texts.items():
         dest = files_dir / rel
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text, encoding="utf-8")
+        _ensure_real_parent(files_dir, dest)
+        _write_text_no_follow(dest, text)
 
     total_original = sum(f["original_tokens"] for f in files_out)
     total_sliced = sum(f["sliced_tokens"] for f in files_out)
@@ -238,10 +316,10 @@ def build_bundle(project, out, budget: int = DEFAULT_BUDGET,
             "estimated_tokens": sum(item["estimated_tokens"]
                                     for item in kept_handoff),
         }
-    (out / "PRIMER.md").write_text(primer_text, encoding="utf-8")
+    _write_text_no_follow(out / "PRIMER.md", primer_text)
     manifest["primer_sha256"] = sha256_text(primer_text)
-    (out / "manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    _write_text_no_follow(
+        out / "manifest.json", json.dumps(manifest, indent=2) + "\n")
     return manifest
 
 
@@ -335,7 +413,15 @@ def _render_primer(facts, layout, mix, entries, files_out, sliced_texts,
 
 
 def check_bundle(bundle_dir) -> tuple[int, dict]:
-    """Return (exit_code, report). 0 pass, 1 fail, 2 could not check."""
+    """Verify a bundle against its manifest.
+
+    Return (exit_code, report): 0 pass, 1 fail (report["errors"] names
+    each mismatch), 2 could not check (for example, no manifest).
+    Recomputes file hashes and sliced-token totals, verifies PRIMER.md
+    against its recorded hash, and re-checks every memory item's
+    provenance: resolved inside the recorded project root and never
+    from a private memory location.
+    """
     bundle = Path(bundle_dir)
     manifest_path = bundle / "manifest.json"
     if not manifest_path.exists():
@@ -344,17 +430,68 @@ def check_bundle(bundle_dir) -> tuple[int, dict]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as exc:
         return 2, {"ok": False, "errors": [f"manifest unreadable: {exc}"]}
+    if not isinstance(manifest, dict):
+        return 2, {"ok": False, "errors": ["manifest is not a JSON object"]}
     errors: list[str] = []
-    root = Path(str(manifest.get("root", "")))
+    root_raw = manifest.get("root", "")
+    if not isinstance(root_raw, str) or not root_raw:
+        errors.append("manifest has no project root")
+        root = Path(".")
+    else:
+        root = Path(root_raw)
     files_checked = 0
     total_sliced = 0
-    for entry in manifest.get("files", []):
+    files_section = manifest.get("files", [])
+    if not isinstance(files_section, list):
+        errors.append("manifest files section is not a list")
+        files_section = []
+    try:
+        files_root = (bundle / "files").resolve()
+    except Exception:
+        files_root = bundle / "files"
+    for entry in files_section:
+        if not isinstance(entry, dict):
+            errors.append("manifest file entry is not an object")
+            continue
         rel = entry.get("path", "")
+        if not isinstance(rel, str) or not rel:
+            errors.append("manifest file entry without a path")
+            continue
+        # The recorded path names both a source inside the project
+        # root and an exported file inside bundle/files. A traversal
+        # or absolute path that escapes either location must fail
+        # the check, even when its hash and token count happen to
+        # match a real file elsewhere on disk (previously such a
+        # forged entry passed with exit 0).
+        if Path(rel).is_absolute():
+            errors.append(f"{rel}: file path is absolute, not project-relative")
+            continue
+        if root_raw:
+            if scan.is_private_memory(root / rel):
+                errors.append(f"{rel}: file sourced from a private memory location")
+                continue
+            try:
+                scan.assert_project_local(root, root / rel)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
         on_disk = bundle / "files" / rel
+        try:
+            resolved_disk = on_disk.resolve()
+        except Exception as exc:
+            errors.append(f"{rel}: exported file path cannot be resolved: {exc}")
+            continue
+        if resolved_disk != files_root and files_root not in resolved_disk.parents:
+            errors.append(f"{rel}: exported file path escapes the bundle")
+            continue
         if not on_disk.exists():
             errors.append(f"{rel}: exported file missing")
             continue
-        text = on_disk.read_text(encoding="utf-8", errors="replace")
+        try:
+            text = on_disk.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"{rel}: exported file unreadable: {exc}")
+            continue
         if sha256_text(text) != entry.get("sha256"):
             errors.append(f"{rel}: sha256 mismatch")
         recomputed = tokens.estimate(text, tokens.language_for(rel))
@@ -369,13 +506,33 @@ def check_bundle(bundle_dir) -> tuple[int, dict]:
     primer_path = bundle / "PRIMER.md"
     if not primer_path.exists():
         errors.append("PRIMER.md missing")
-    elif sha256_text(primer_path.read_text(encoding="utf-8", errors="replace")) \
-            != manifest.get("primer_sha256"):
-        errors.append("PRIMER.md: sha256 mismatch (tampered or stale)")
-    for item in manifest.get("memory_items", []):
-        prov = (item.get("provenance") or {}).get("path", "")
-        if not prov:
+    else:
+        try:
+            primer_text_on_disk = primer_path.read_text(
+                encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"PRIMER.md unreadable: {exc}")
+            primer_text_on_disk = None
+        if primer_text_on_disk is not None and \
+                sha256_text(primer_text_on_disk) != manifest.get("primer_sha256"):
+            errors.append("PRIMER.md: sha256 mismatch (tampered or stale)")
+    memory_section = manifest.get("memory_items", [])
+    if not isinstance(memory_section, list):
+        errors.append("manifest memory_items section is not a list")
+        memory_section = []
+    for item in memory_section:
+        if not isinstance(item, dict):
+            errors.append("manifest memory item is not an object")
+            continue
+        prov_obj = item.get("provenance") or {}
+        prov = prov_obj.get("path", "") if isinstance(prov_obj, dict) else ""
+        if not prov or not isinstance(prov, str):
             errors.append(f"{item.get('id')}: memory item without provenance")
+            continue
+        if prov == "handoff.json":
+            # Handoff items are recorded with a pack provenance handled
+            # by the handoff_input section; their path is the pack's
+            # own file name, not a project-relative memory source.
             continue
         candidate = root / prov
         if scan.is_private_memory(candidate):

@@ -1,4 +1,10 @@
-"""Secret-shaped literal scan (shapes only, values never reported)."""
+"""Secret-shaped literal scan (shapes only, values never reported).
+
+Used as a gate, not a vault: callers block or exclude anything this
+scan flags and record only the shape name and line number. A clean
+scan is not a guarantee that a file holds no secrets, only that none
+of the recognised shapes in _PATTERNS were found.
+"""
 from __future__ import annotations
 
 import re

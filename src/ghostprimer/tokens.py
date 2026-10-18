@@ -60,10 +60,15 @@ else:
 
 
 def slice_available() -> bool:
+    """True when GhostSlice's estimator was loaded (see module docstring);
+    False means totals use the chars/4 fallback and will not reproduce
+    under ``ghostslice check``."""
     return _SLICE is not None
 
 
 def language_for(path: str) -> str:
+    """Language label for *path*, used for estimation and the manifest.
+    Delegates to GhostSlice when available, else maps the extension."""
     if _SLICE is not None:
         try:
             from ghostslice.scanner import language_for as lf  # type: ignore

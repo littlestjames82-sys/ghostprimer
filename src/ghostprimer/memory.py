@@ -19,7 +19,7 @@ import re
 from pathlib import Path
 
 from . import secrets as secrets_mod
-from .scan import assert_project_local
+from .scan import assert_project_local, is_private_memory
 
 FALLBACK_FILES = [
     "AGENTS.md", "CLAUDE.md", "DECISIONS.md", "CHANGELOG.md",
@@ -43,6 +43,12 @@ def _sections(text: str):
 
 
 def _extract_file(rel: str, text: str, changelog: bool = False) -> list[dict]:
+    """Split one memory file into heading sections and extract items.
+
+    Each item is a heading plus up to PER_SECTION_LINE_CAP non-blank
+    body lines, capped at PER_FILE_LINE_CAP lines per file. With
+    changelog=True only the preamble and the latest entry are kept.
+    """
     items = []
     sections = list(_sections(text))
     if changelog:
@@ -79,7 +85,14 @@ def _extract_file(rel: str, text: str, changelog: bool = False) -> list[dict]:
 
 
 def fallback_memory(root: Path) -> tuple[list[dict], list[dict]]:
-    """Return (items, blocked) from the fixed project-local file list."""
+    """Shallow fallback memory: (items, blocked) from a fixed file list.
+
+    Reads only the well-known project-local files in FALLBACK_FILES
+    plus ``docs/decisions/*.md``, when present. Each candidate is
+    passed through the resolved-path check first; a refused path and
+    a secret-flagged item both land in blocked (recorded, not read
+    into the pack), never silently dropped.
+    """
     items: list[dict] = []
     blocked: list[dict] = []
     candidates: list[Path] = []
@@ -97,7 +110,14 @@ def fallback_memory(root: Path) -> tuple[list[dict], list[dict]]:
         except ValueError as exc:
             blocked.append({"path": rel, "reason": str(exc)})
             continue
-        text = resolved.read_text(encoding="utf-8", errors="replace")
+        try:
+            if resolved.is_dir():
+                raise IsADirectoryError(f"memory source is a directory: {p}")
+            text = resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            blocked.append({"path": rel,
+                            "reason": f"memory source unreadable; skipped: {exc}"})
+            continue
         # Block at item granularity, per the plan: the item whose text
         # carries a secret-shaped literal is excluded and recorded
         # (path, item, shapes only - never the value); the file's other
@@ -131,11 +151,27 @@ def recall_bundle_memory(root: Path, bundle_dir: Path) -> tuple[list[dict], list
     manifest. Superseded, excluded and blocked items are never included.
     """
     blocked: list[dict] = []
+    bundle_dir = Path(bundle_dir)
+    if is_private_memory(bundle_dir):
+        raise ValueError(
+            f"refused: recall bundle is in a private memory location: {bundle_dir}")
     manifest_path = bundle_dir / "manifest.json"
     if not manifest_path.exists():
         raise ValueError(f"recall bundle has no manifest.json: {bundle_dir}")
-    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(
+            f"recall bundle manifest is not valid JSON: {manifest_path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"recall bundle manifest is not an object: {manifest_path}")
     entries = data.get("items") or data.get("memory_items") or data.get("files") or []
+    if not isinstance(entries, list):
+        raise ValueError(f"recall bundle manifest items are not a list: {manifest_path}")
+    try:
+        bundle_resolved = bundle_dir.resolve()
+    except Exception as exc:
+        raise ValueError(f"recall bundle path cannot be resolved: {bundle_dir}") from exc
     items: list[dict] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -147,23 +183,62 @@ def recall_bundle_memory(root: Path, bundle_dir: Path) -> tuple[list[dict], list
         if status in ("superseded", "excluded", "blocked") or mode == "exclude":
             continue
         provenance = entry.get("provenance") or {}
+        if not isinstance(provenance, dict):
+            provenance = {}
         src_path = provenance.get("path") or entry.get("path") or ""
         text = None
         exported = entry.get("exported_file") or entry.get("file")
         if exported:
-            candidate = bundle_dir / "files" / Path(str(exported)).name \
-                if (bundle_dir / "files" / Path(str(exported)).name).exists() \
-                else bundle_dir / str(exported)
-            if candidate.exists():
-                text = candidate.read_text(encoding="utf-8", errors="replace")
+            # An exported item file must stay inside the recall bundle
+            # itself. An absolute path or a ../ traversal (previously
+            # joined unchecked, so it could name any file on disk -
+            # including the user's private memory) is blocked, never
+            # read; a bundle-internal symlink escaping the bundle is
+            # refused the same way.
+            candidates = [bundle_dir / "files" / Path(str(exported)).name,
+                          bundle_dir / str(exported)]
+            exported_blocked = False
+            for candidate in candidates:
+                try:
+                    if not candidate.exists():
+                        continue
+                    resolved_c = candidate.resolve()
+                except Exception:
+                    exported_blocked = True
+                    continue
+                if is_private_memory(candidate) or (
+                        resolved_c != bundle_resolved
+                        and bundle_resolved not in resolved_c.parents):
+                    exported_blocked = True
+                    continue
+                try:
+                    if resolved_c.is_dir():
+                        continue
+                    text = resolved_c.read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    exported_blocked = True
+                    continue
+                break
+            if text is None and exported_blocked:
+                blocked.append({
+                    "path": src_path or str(exported),
+                    "reason": "refused: recall exported file resolves "
+                              "outside the recall bundle or is unreadable; "
+                              "item blocked"})
+                continue
         if text is None and src_path:
             candidate = root / src_path
             try:
                 resolved = assert_project_local(root, candidate)
-                if resolved.exists():
+                if resolved.exists() and not resolved.is_dir():
                     text = resolved.read_text(encoding="utf-8", errors="replace")
             except ValueError as exc:
                 blocked.append({"path": src_path, "reason": str(exc)})
+                continue
+            except OSError:
+                blocked.append({"path": src_path,
+                                "reason": "recall item source unreadable; skipped"})
                 continue
         if text is None:
             blocked.append({"path": src_path or str(entry.get("id")),
@@ -174,13 +249,17 @@ def recall_bundle_memory(root: Path, bundle_dir: Path) -> tuple[list[dict], list
             blocked.append({"path": src_path,
                             "reason": "secret-shaped literal in recall item; blocked"})
             continue
+        try:
+            prov_line = int(provenance.get("line", 1) or 1)
+        except (TypeError, ValueError):
+            prov_line = 1
         items.append({
             "id": str(entry.get("id") or f"memory-{src_path}"),
             "source_type": "memory",
             "title": str(entry.get("title") or src_path),
             "text": text,
             "provenance": {"path": src_path,
-                           "line": int(provenance.get("line", 1) or 1)},
+                           "line": prov_line},
             "status": "current",
         })
     return items, blocked

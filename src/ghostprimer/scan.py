@@ -28,15 +28,22 @@ ENTRY_NAMES = {"__main__.py", "main.py", "app.py", "cli.py", "index.js",
 
 
 def private_memory_roots() -> list[Path]:
+    """The private memory locations refused by resolved-path check:
+    ``~/MEMORY.md`` and ``~/memory/`` (both resolved)."""
     home = Path.home()
     return [(home / "MEMORY.md").resolve(), (home / "memory").resolve()]
 
 
 def is_private_memory(path: Path) -> bool:
+    """True when *path* resolves to, or inside, a private memory
+    location. Resolution follows symlinks, so a symlink into private
+    memory is still private memory."""
     try:
         resolved = path.resolve()
     except Exception:
-        return False
+        # Fail closed: a path that cannot be resolved (symlink loop,
+        # too many links) must never be waved through as safe.
+        return True
     for root in private_memory_roots():
         if resolved == root or root in resolved.parents:
             return True
@@ -49,16 +56,27 @@ def assert_project_local(root: Path, path: Path) -> Path:
     Raises ValueError naming the reason when refused: private-memory
     location, or outside the project root.
     """
+    try:
+        # Resolve first so an unresolvable path (symlink loop) is
+        # reported as such, not mislabelled by the fail-closed
+        # private-memory check below.
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except Exception as exc:
+        # Symlink loops and other unresolvable paths are refusals with
+        # a clean ValueError, not a RuntimeError/OSError crash for the
+        # caller (the CLI only reports ValueError cleanly).
+        raise ValueError(f"refused: source path cannot be resolved: {path}: {exc}") from exc
     if is_private_memory(path):
         raise ValueError(f"refused: source is in a private memory location: {path}")
-    resolved = path.resolve()
-    root_resolved = root.resolve()
     if resolved != root_resolved and root_resolved not in resolved.parents:
         raise ValueError(f"refused: source is outside the project root: {path}")
     return resolved
 
 
 def iter_project_files(root: Path):
+    """Yield (relative POSIX path, absolute path) for every file under
+    *root*, skipping VCS, cache, and build directories (SKIP_DIRS)."""
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS
                              and not d.endswith(".egg-info"))
@@ -68,11 +86,21 @@ def iter_project_files(root: Path):
 
 
 def project_facts(root: Path) -> dict:
+    """Extract name, version, description, requires-python, scripts,
+    and main from pyproject.toml and/or package.json.
+
+    A field that cannot be found stays None (or empty): callers record
+    it as "not found" rather than inventing a value. Unreadable or
+    malformed metadata files are ignored, not fatal.
+    """
     facts: dict = {"name": None, "version": None, "description": None,
                    "requires_python": None, "scripts": {}, "main": None}
     pyproject = root / "pyproject.toml"
     if pyproject.exists():
         try:
+            # A metadata file that is a symlink out of the project (or
+            # into private memory) must not contribute facts.
+            pyproject = assert_project_local(root, pyproject)
             data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
             proj = data.get("project", {})
             facts["name"] = proj.get("name") or facts["name"]
@@ -85,6 +113,7 @@ def project_facts(root: Path) -> dict:
     pkg_json = root / "package.json"
     if pkg_json.exists():
         try:
+            pkg_json = assert_project_local(root, pkg_json)
             data = json.loads(pkg_json.read_text(encoding="utf-8"))
             facts["name"] = facts["name"] or data.get("name")
             facts["version"] = facts["version"] or data.get("version")
@@ -100,6 +129,7 @@ def project_facts(root: Path) -> dict:
 
 
 def readme_path(root: Path) -> Path | None:
+    """First existing README file at the project root, or None."""
     for name in ("README.md", "README.rst", "README.txt", "README"):
         p = root / name
         if p.exists():
@@ -108,6 +138,9 @@ def readme_path(root: Path) -> Path | None:
 
 
 def find_entry_points(root: Path, facts: dict) -> list[str]:
+    """Sorted relative paths of likely entry points: console-script
+    and package.json main targets, well-known entry filenames near
+    the top of the tree, and shallow package ``__init__.py`` files."""
     entries: set[str] = set()
     # Script targets like "pkg.cli:main" point at a module file.
     for target in (facts.get("scripts") or {}).values():
@@ -134,6 +167,7 @@ def find_entry_points(root: Path, facts: dict) -> list[str]:
 
 
 def language_mix(root: Path) -> dict:
+    """Count of code files per extension, most common first."""
     mix: dict[str, int] = {}
     for rel, _p in iter_project_files(root):
         ext = Path(rel).suffix.lower()
@@ -143,6 +177,8 @@ def language_mix(root: Path) -> dict:
 
 
 def top_level_layout(root: Path) -> list[str]:
+    """Sorted top-level names (directories suffixed with "/"),
+    skipping hidden names and SKIP_DIRS."""
     out = []
     for child in sorted(root.iterdir(), key=lambda c: c.name):
         if child.name in SKIP_DIRS or child.name.startswith("."):
@@ -176,7 +212,8 @@ def python_fan_in(root: Path) -> dict[str, int]:
     fan_in: dict[str, int] = {rel: 0 for rel, _ in files}
     for rel, p in files:
         try:
-            tree = ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+            resolved = assert_project_local(root, p)
+            tree = ast.parse(resolved.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             continue
         imported: set[str] = set()
@@ -490,7 +527,8 @@ def js_fan_in(root: Path) -> dict[str, int]:
     fan_in: dict[str, int] = {rel: 0 for rel, _ in files}
     for rel, p in files:
         try:
-            source = p.read_text(encoding="utf-8", errors="replace")
+            resolved = assert_project_local(root, p)
+            source = resolved.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
         targets: set[str] = set()

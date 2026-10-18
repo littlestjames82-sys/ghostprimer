@@ -1,4 +1,11 @@
-"""Doctor: read-only report of primer sources on a project."""
+"""Doctor: read-only report of primer sources on a project.
+
+Answers "what would a build find here?" without writing anything:
+extracted facts, entry points, which fallback memory files exist,
+whether a Recall bundle is present at a conventional location, and
+which token estimator is in use. A project root that resolves to a
+private memory location is reported as refused, never read.
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,6 +15,12 @@ from .memory import FALLBACK_FILES
 
 
 def doctor(project) -> dict:
+    """Return the read-only report dict for *project*.
+
+    ``ok`` is False (with ``errors``) when the project is missing or
+    is a private memory location; otherwise ``ok`` is True even when
+    individual memory sources are simply absent.
+    """
     root = Path(project)
     if not root.is_dir():
         return {"ok": False, "errors": [f"project not found: {project}"]}

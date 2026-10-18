@@ -8,6 +8,10 @@ secret-shape scan as project memory; a flagged item is blocked and
 recorded, never included. The items are returned unbudgeted: bundle
 assembly puts them in the shared memory budget pool, so a supplied
 handoff competes for the same memory share as Recall/fallback items.
+
+Reading order inside a pack: state first, then open loops, then next
+steps, matching the section order _render_primer emits for handoff
+items in bundle.py.
 """
 from __future__ import annotations
 
